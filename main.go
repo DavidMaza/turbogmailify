@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/mail"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/YoRyan/turbogmailify/internal/mocks"
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/pelletier/go-toml/v2"
@@ -107,11 +110,15 @@ type config struct {
 }
 
 type configImap struct {
-	Address    string
-	Username   string
-	Password   string
-	Folders    map[string][]string
-	IdleFolder string // folder to IDLE on; defaults to "INBOX" if empty
+	Address            string
+	Username           string
+	Password           string
+	Folders            map[string][]string
+	ArchiveFolders     map[string]string
+	FailedFolders      map[string]string
+	NeverMarkSpam      map[string]bool
+	ProcessForCalendar map[string]bool
+	IdleFolder         string // folder to IDLE on; defaults to "INBOX" if empty
 }
 
 func (c *config) getOAuthConfig() (oa *oauth2.Config) {
@@ -208,9 +215,13 @@ func doForwarding(ctx context.Context, c *config) {
 }
 
 type forwardConfig struct {
-	Id                  string
-	FolderToLabels      map[string][]string
-	FolderOrderIdleLast []string
+	Id                         string
+	FolderToLabels             map[string][]string
+	FolderToArchive            map[string]string
+	FolderToFailed             map[string]string
+	FolderToNeverMarkSpam      map[string]bool
+	FolderToProcessForCalendar map[string]bool
+	FolderOrderIdleLast        []string
 }
 
 func createForwardConfig(c *configImap) forwardConfig {
@@ -252,16 +263,83 @@ func createForwardConfig(c *configImap) forwardConfig {
 	ordered = append(ordered, idle)
 
 	return forwardConfig{
-		Id:                  c.Username,
-		FolderToLabels:      folders,
+		Id:             c.Username,
+		FolderToLabels: folders,
+		// Reusing ordered is more convenient than iterating through all the
+		// keys in folders just to produce a slice.
+		FolderToArchive: folderMap[string]{m: c.ArchiveFolders, folders: ordered}.wildcard().done(),
+		FolderToFailed:  folderMap[string]{m: c.FailedFolders, folders: ordered}.wildcard().done(),
+		FolderToNeverMarkSpam: folderMap[bool]{m: c.NeverMarkSpam, folders: ordered}.def(map[string]bool{
+			"Junk": true,
+		}).wildcard().fallback(false).done(),
+		FolderToProcessForCalendar: folderMap[bool]{m: c.ProcessForCalendar, folders: ordered}.def(map[string]bool{
+			"Junk": false,
+		}).wildcard().fallback(true).done(),
 		FolderOrderIdleLast: ordered,
 	}
+}
+
+// A map of IMAP folders to configuration values that includes a list of all
+// possible keys (folders).
+type folderMap[V any] struct {
+	m       map[string]V
+	folders []string
+}
+
+// Specifies a default map if the user has not already configured one.
+func (fm folderMap[V]) def(def map[string]V) folderMap[V] {
+	var m map[string]V
+	if len(fm.m) <= 0 {
+		m = def
+	} else {
+		m = fm.m
+	}
+	folders := fm.folders
+	return folderMap[V]{m, folders}
+}
+
+// Adds the wildcard (*) value to the map, which populates a value for all
+// folders that do not already have explicit values.
+func (fm folderMap[V]) wildcard() folderMap[V] {
+	wildcard, isWildcard := fm.m["*"]
+	m := make(map[string]V, len(fm.folders))
+	for _, k := range fm.folders {
+		if v, ok := fm.m[k]; ok {
+			m[k] = v
+		} else if isWildcard {
+			m[k] = wildcard
+		}
+	}
+	folders := fm.folders
+	return folderMap[V]{m, folders}
+}
+
+// Specifies a fallback value so that every folder is mapped to something.
+func (fm folderMap[V]) fallback(fb V) folderMap[V] {
+	m := make(map[string]V, len(fm.folders))
+	for _, k := range fm.folders {
+		if v, ok := fm.m[k]; ok {
+			m[k] = v
+		} else {
+			m[k] = fb
+		}
+	}
+	folders := fm.folders
+	return folderMap[V]{m, folders}
+}
+
+// Finalizes this structure into an ordinary map.
+func (fm folderMap[V]) done() map[string]V {
+	return fm.m
 }
 
 type session struct {
 	client        *imapclient.Client
 	mailboxUpdate <-chan *imapclient.UnilateralDataMailbox
 	idleDeadline  time.Duration
+	// Set of (mailbox, uid) tuples that failed to import. (This structure does
+	// not survive restarts, so we'll ignore uid validity.)
+	importFailedUids map[string]map[imap.UID]struct{}
 }
 
 func createSession(c *configImap) (*session, error) {
@@ -294,46 +372,101 @@ func createSession(c *configImap) (*session, error) {
 		return nil, err
 	}
 
-	return &session{client, mailboxUpdate, maxPollTime}, nil
+	// Pre-populate the importFailedUids map so it always works as expected.
+	importFailed := make(map[string]map[imap.UID]struct{}, len(c.Folders))
+	for folder := range c.Folders {
+		importFailed[folder] = make(map[imap.UID]struct{}, 0)
+	}
+
+	return &session{client, mailboxUpdate, maxPollTime, importFailed}, nil
 }
 
-// Make a new connection to the IMAP server and retrieve and expunge messages.
+// Make a new connection to the IMAP server and retrieve and process messages.
 func (s *session) forwardAndIdle(f forwardConfig, gm gmailInbox) error {
-	// Interrogate each folder and retrieve and expunge everything inside.
+	// Interrogate each folder and retrieve and process everything inside.
 	// Idle folder is always last so it remains selected when we enter IDLE.
 	for _, folder := range f.FolderOrderIdleLast {
 		labels := f.FolderToLabels[folder]
-		for {
-			inbox, err := s.client.
-				Select(folder, nil).
-				Wait()
+
+		// SELECT picks the desired folder and also comes with a message count.
+		inbox, err := s.client.
+			Select(folder, nil).
+			Wait()
+		if err != nil {
+			log.Println("SELECT error:", err)
+			return err
+		}
+
+		// Finish all imports as a single step before moving or expunging any
+		// messages. These operations affect the sequence numbers.
+		var (
+			successUids = make([]imap.UID, 0)
+			failUids    = make([]imap.UID, 0)
+		)
+		failFolder, failFolderOk := f.FolderToFailed[folder]
+		for i := range inbox.NumMessages {
+			uid, envelope, err := s.fetchMessage(i + 1)
 			if err != nil {
-				log.Println("SELECT error:", err)
 				return err
 			}
 
-			if inbox.NumMessages <= 0 {
-				break
+			if _, failed := s.importFailedUids[folder][uid]; failed {
+				// Skip anything on the in-memory blacklist.
+				continue
 			}
 
-			uid, envelope, err := s.fetchFirstMessage()
-			if err != nil {
-				return err
-			}
-			if envelope == nil {
-				break
-			}
-
+			sum := messageSummary(envelope)
 			log.Printf(
-				"Importing message received by %s (uid %d, size %.1fK, folder %s)",
-				f.Id, uid, float32(len(envelope))/1024, folder)
+				"Importing message received by %s (folder %s, size %s, subject %s)",
+				f.Id, folder, sum.size, sum.subject)
 
-			if err := gm.DoImport(envelope, labels...); err != nil {
-				return err
+			if err := gm.DoImport(envelope, f.FolderToNeverMarkSpam[folder], f.FolderToProcessForCalendar[folder], labels...); err != nil {
+				log.Printf("Error importing message: %v", err)
+				if isImportRetryable(err) {
+					// Leave it alone; try again next cycle.
+				} else {
+					failUids = append(failUids, uid)
+
+					var disposition string
+					if failFolderOk {
+						disposition = fmt.Sprintf("The message has been moved to %s, the configured IMAP folder for failed messages.", failFolder)
+					} else {
+						disposition = "The message will not be uploaded again until the next restart of the service. It is recommended that you designate an IMAP folder to move failed messages into so they will not be retried again. This can be done with the FailedFolders option."
+					}
+					sendNotification(gm, fmt.Sprintf("Message Import Failure: %s (%s)", f.Id, folder), fmt.Sprintf("Error: %v\nAccount: %s\nFolder: %s\nSubject: %s\nMessage-ID: %s\nSize: %s\n\n%s", err, f.Id, folder, sum.subject, sum.messageId, sum.size, disposition))
+				}
+			} else {
+				successUids = append(successUids, uid)
 			}
+		}
 
-			if err := s.deleteMessage(uid); err != nil {
-				return err
+		if dest, ok := f.FolderToArchive[folder]; ok {
+			// Move to the configured archive folder.
+			for _, uid := range successUids {
+				if err := s.moveMessage(uid, dest); err != nil {
+					return err
+				}
+			}
+		} else {
+			// Expunge
+			for _, uid := range successUids {
+				if err := s.deleteMessage(uid); err != nil {
+					return err
+				}
+			}
+		}
+
+		if failFolderOk {
+			// Move to the configured failed folder.
+			for _, uid := range failUids {
+				if err := s.moveMessage(uid, failFolder); err != nil {
+					return err
+				}
+			}
+		} else {
+			// Add to the in-memory blacklist.
+			for _, uid := range failUids {
+				s.importFailedUids[folder][uid] = struct{}{}
 			}
 		}
 	}
@@ -346,14 +479,14 @@ func (s *session) forwardAndIdle(f forwardConfig, gm gmailInbox) error {
 	return nil
 }
 
-// Retrieve inbox message sequence number 1.
-func (s *session) fetchFirstMessage() (uid imap.UID, data []byte, err error) {
+// Retrieve one message from an inbox by sequence number.
+func (s *session) fetchMessage(seq uint32) (uid imap.UID, data []byte, err error) {
 	var (
 		// Set an empty body section to request the raw contents of the entire
 		// message.
 		entireMessage = []*imap.FetchItemBodySection{{}}
 		fetch         = s.client.Fetch(
-			imap.SeqSetNum(1), &imap.FetchOptions{BodySection: entireMessage, UID: true})
+			imap.SeqSetNum(seq), &imap.FetchOptions{BodySection: entireMessage, UID: true})
 	)
 	defer fetch.Close()
 
@@ -363,7 +496,9 @@ func (s *session) fetchFirstMessage() (uid imap.UID, data []byte, err error) {
 		return
 	}
 
-	if len(messages) <= 0 {
+	nMessages := len(messages)
+	if nMessages != 1 {
+		err = fmt.Errorf("invalid number of fetch message buffers: %d", nMessages)
 		return
 	}
 
@@ -376,21 +511,43 @@ func (s *session) fetchFirstMessage() (uid imap.UID, data []byte, err error) {
 	return
 }
 
+type summary struct {
+	size      string
+	subject   string
+	messageId string
+}
+
+func messageSummary(envelope []byte) summary {
+	size := fmt.Sprintf("%.1fK", float32(len(envelope))/1024)
+	msg, err := mail.ReadMessage(bytes.NewReader(envelope))
+	if err == nil {
+		return summary{
+			size:      size,
+			subject:   msg.Header.Get("Subject"),
+			messageId: msg.Header.Get("Message-ID"),
+		}
+	} else {
+		return summary{
+			size: size,
+		}
+	}
+}
+
 // A Gmail target that can accept imported messages. This is an interface for
 // testing purposes.
 type gmailInbox interface {
-	DoImport(envelope []byte, labels ...string) error
+	DoImport(envelope []byte, neverMarkSpam, processForCalendar bool, labels ...string) error
 }
 
 type gmailInboxReal gmail.Service
 
 // Import this message to Gmail via media upload.
-func (gm *gmailInboxReal) DoImport(envelope []byte, labels ...string) error {
+func (gm *gmailInboxReal) DoImport(envelope []byte, neverMarkSpam, processForCalendar bool, labels ...string) error {
 	r, err := gm.Users.Messages.
 		Import("me", &gmail.Message{LabelIds: append(labels, "UNREAD")}).
 		InternalDateSource("dateHeader").
-		NeverMarkSpam(false).
-		ProcessForCalendar(true).
+		NeverMarkSpam(neverMarkSpam).
+		ProcessForCalendar(processForCalendar).
 		Deleted(false).
 		Media(
 			bytes.NewReader(envelope),
@@ -404,6 +561,45 @@ func (gm *gmailInboxReal) DoImport(envelope []byte, labels ...string) error {
 	if r.HTTPStatusCode != 200 {
 		err := fmt.Errorf("gmail returned status code: %v", r.HTTPStatusCode)
 		log.Println(err)
+		return err
+	}
+
+	return nil
+}
+
+func isImportRetryable(err error) bool {
+	if gerr, ok := errors.AsType[*googleapi.Error](err); ok {
+		// The following API errors are known:
+		//   400: Invalid attachment (prohibited .exe attachment)
+		return gerr.Code != 400
+	}
+
+	if errors.Is(err, mocks.ErrNonRetryable) {
+		return false
+	}
+
+	return true
+}
+
+func sendNotification(gm gmailInbox, subject, body string) error {
+	envelope := fmt.Sprintf(`From: Turbogmailify <me>
+To: me
+Subject: %s
+Content-Type: text/plain
+
+%s
+`, subject, body)
+	return gm.DoImport([]byte(envelope), true, false, "INBOX")
+}
+
+// Move a message into another mailbox using IMAP MOVE or, if that command is
+// not available, COPY/STORE/EXPUNGE.
+func (s *session) moveMessage(uid imap.UID, mailbox string) error {
+	if _, err := s.client.
+		Move(imap.UIDSetNum(uid), mailbox).
+		Wait(); err != nil {
+
+		log.Println("MOVE error:", err)
 		return err
 	}
 
